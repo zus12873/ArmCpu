@@ -39,15 +39,35 @@ With a PSCI conduit in `/psci`, the driver installs `arm64_platform_sleep_hook`
 core as stopped. `quiesceCPU`, which `cpu_sleep` calls on each core, enters
 `ml_arm_sleep` while the system quiesces. A core other than the boot core then
 turns itself off with PSCI CPU_OFF and comes back through CPU_ON and the reset
-vector, set up by `initCPU(false)` as at its first start. The boot core waits
-with interrupts masked. Only the board's wake sources stay enabled at the
-distributor (`armcpu_sleep_register`, `ArmCpuSleep.h`), and WFI ends on a
-pending one. The board's `should_wake` decides, or the virtual timer does after
-`platform-sleep-wake-after=<seconds>`. The board's `prepare` and `restore` run
-around the wait, and the enables are put back. The waking interrupt stays
-pending for its driver, and `initCPU(false)` turns the boot core's CPU
-interface and timer on again. `armcpu_sleep_stats` records the phase reached,
-the sleeps, spurious wakes, the waking INTID and reason, and the time asleep.
+vector, set up by `initCPU(false)` as at its first start.
+
+The boot core waits with interrupts masked. Only the board's wake sources stay
+enabled at the distributor (`armcpu_sleep_register`, `ArmCpuSleep.h`), and WFI
+ends on a pending one. A source the board's `should_wake` accepts stays pending
+for its driver. Every other interrupt is acknowledged and ended. A line that
+keeps firing after the board turned it down is turned off for the rest of the
+sleep; when that leaves nothing to wake the system, it wakes.
+
+The virtual timer (an absolute `CNTV_CVAL`) carries two deadlines:
+- the wake-after deadline of `platform-sleep-wake-after=<seconds>`;
+- the board's `tick`, every `tick_s` seconds while asleep (the watchdog ping on
+  sheng).
+
+When the timer fires, a wake source pending behind it is asked about first.
+With no wake source enabled and no wake-after deadline, the wait returns at
+once. The board's `prepare` and `restore` run around the wait, and the enables
+are put back. `initCPU(false)` turns the boot core's CPU interface and timer on
+again. It also sends the core a self-IPI, which `processor_cpu_reinit` waits
+for; a resuming secondary core sends one too.
+
+`armcpu_sleep_stats` records:
+- the phase reached;
+- the sleeps;
+- spurious wakes, masked lines and ticks;
+- sleeps that returned at once;
+- the waking INTID and reason;
+- the time asleep.
+
 `tools/check-sleep-host.py` tests the logic on the host.
 
 `armcpu-idle-latency-us=N` registers every core with that time as its power

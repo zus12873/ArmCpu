@@ -735,7 +735,8 @@ void ArmCpu::initCPU (bool boot)
     if (boot) { armcpu_smp_running = armcpu_smp_running + 1; }
     // XNU clears SIGPdisabled for a core the first time that core takes an IPI, and cpu_signal() silently skips a core until then; Apple's
     // CPU driver provokes it with a self-IPI from initCPU (osfmk/kern/machine.c, processor_up).
-    if (gSelfIpi) { signalCPU (this); }
+    // Back from platform sleep the self-IPI is sent whatever armcpu-self-ipi says: processor_cpu_reinit waits for it.
+    if (gSelfIpi || !boot) { signalCPU (this); }
     return;
   }
   if (!boot) {
@@ -747,6 +748,9 @@ void ArmCpu::initCPU (bool boot)
       enableCPUTimeBase (true);
     }
     setCPUState (kIOCPUStateRunning);
+    // processor_cpu_reinit then turns interrupts on and waits until this core takes an IPI (SIGPdisabled, osfmk/kern/machine.c); no other
+    // core runs yet to send one, so the core sends itself one.
+    if (!skipGic) { signalCPU (this); }
     return;
   }
   if (skipGic) {
@@ -1037,18 +1041,41 @@ static bool sleepIsWakeSource (const struct armcpu_sleep_board *board, uint32_t 
   return false;
 }
 
-// The boot core, interrupts masked: only the wake sources enabled at the distributor, the CPU interface's Group 1 on so that WFI ends
-// on a pending one, and nothing acknowledged. A source the board turns down (and every other pending SPI) has its pending state
-// cleared; the wake source stays pending for its driver to take after the wake.
+// The virtual timer while asleep: the next of the wake-after deadline and the board's tick, as an absolute CNTV_CVAL; off for neither.
+static void sleepArmTimer (uint64_t at)
+{
+  uint64_t value = 2;   // masked, off
+  if (at != ARMCPU_SLEEP_NEVER) {
+    __asm__ volatile ("msr cntv_cval_el0, %0" :: "r" (at) : "memory");
+    value = 1;          // enabled, not masked
+  }
+  __asm__ volatile ("msr cntv_ctl_el0, %0\n\tisb" :: "r" (value) : "memory");
+}
+
+// Acknowledges and ends the highest pending interrupt (EOImode 0: EOIR1 also deactivates it). A level line still asserted is pending
+// again at once; the wait loop counts that towards a storm.
+static void sleepAcknowledge (void)
+{
+  uint64_t id;
+  __asm__ volatile ("mrs %0, icc_iar1_el1" : "=r" (id));
+  id &= 0xffffff;
+  if (id < 1020) { __asm__ volatile ("msr icc_eoir1_el1, %0\n\tisb" :: "r" (id) : "memory"); }
+}
+
+// The boot core, interrupts masked: only the board's enabled wake sources stay on at the distributor, and the CPU interface's Group 1 is
+// on so that WFI ends on a pending one. A wake source the board accepts stays pending for its driver to take after the wake; every other
+// interrupt is acknowledged and ended, and a line that keeps firing after the board turned it down (ARMCPU_SLEEP_STORM_LIMIT times in a
+// row, each within a millisecond) is turned off for the rest of the sleep. The virtual timer carries the wake-after deadline and the
+// board's ticks; when it fires, a wake source pending behind it (its PPI outranks device SPIs) is asked about first. With no wake
+// source enabled and no wake-after deadline, nothing could end the wait, so it returns at once.
 static void sleepBootWait (void)
 {
   volatile struct armcpu_sleep_stats &st = armcpu_sleep_stats;
   __asm__ volatile ("msr daifset, #15" ::: "memory");
   const struct armcpu_sleep_board *board = __atomic_load_n (&gSleepBoard, __ATOMIC_ACQUIRE);
-  const uint32_t timer = gSleepWakeAfterS != 0 ? kVirtualTimerPpi : ARMCPU_SLEEP_NO_TIMER;
   st.phase = 2;
-  if (gDist == 0 || (board == nullptr && timer == ARMCPU_SLEEP_NO_TIMER)) {
-    // Nothing could wake the system: return at once (a sleep that lasts no time) rather than wait for good.
+  if (gDist == 0) {
+    st.unarmed = st.unarmed + 1;
     st.last_reason = ArmcpuWakeNone;
     st.phase = 5;
     return;
@@ -1058,40 +1085,77 @@ static void sleepBootWait (void)
   uint32_t saved[ARMCPU_SLEEP_SPI_WORDS] = {}, keep[ARMCPU_SLEEP_SPI_WORDS];
   for (unsigned w = 1; w < words; w++) { saved[w] = read32 (gDist, 0x100 + 4 * w); }
   armcpu_sleep_keep (saved, board != nullptr ? board->wake_spis : nullptr, board != nullptr ? board->wake_spi_count : 0, keep);
+  const uint64_t start = counter ();
+  const uint64_t wakeAt = armcpu_sleep_deadline (start, gSleepWakeAfterS, gCounterHz);
+  if (!armcpu_sleep_armed (keep) && wakeAt == ARMCPU_SLEEP_NEVER) {
+    st.unarmed = st.unarmed + 1;
+    st.last_reason = ArmcpuWakeNone;
+    st.phase = 5;
+    return;
+  }
+  const uint64_t tickTicks = board != nullptr && board->tick != nullptr && board->tick_s != 0 ? uint64_t (board->tick_s) * gCounterHz : 0;
+  uint64_t tickAt = tickTicks != 0 ? start + tickTicks : ARMCPU_SLEEP_NEVER;
   for (unsigned w = 1; w < words; w++) { write32 (gDist, 0x180 + 4 * w, 0xffffffff); }
   (void)waitClear (gDist, 0, 1U << 31);
   for (unsigned w = 1; w < words; w++) { if (keep[w] != 0) { write32 (gDist, 0x100 + 4 * w, keep[w]); } }
   if (board != nullptr && board->prepare != nullptr) { board->prepare (); }
-  uint64_t value;
-  if (timer != ARMCPU_SLEEP_NO_TIMER) {
-    value = gCounterHz * gSleepWakeAfterS;
-    __asm__ volatile ("msr cntv_tval_el0, %0" :: "r" (value) : "memory");
-    value = 1;   // enabled, not masked
-    __asm__ volatile ("msr cntv_ctl_el0, %0\n\tisb" :: "r" (value) : "memory");
-  }
-  const uint64_t start = counter ();
-  value = 1;
+  sleepArmTimer (armcpu_sleep_next (wakeAt, tickAt));
+  uint64_t value = 1;
   __asm__ volatile ("msr icc_igrpen1_el1, %0\n\tdsb sy\n\tisb" :: "r" (value) : "memory");
   st.phase = 3;
-  uint32_t intid = 1023;
+  struct armcpu_sleep_storm storm = {};
+  uint32_t intid = ARMCPU_SLEEP_SPURIOUS;
   enum armcpu_wake_reason reason = ArmcpuWakeNone;
   for (;;) {
     __asm__ volatile ("dsb sy\n\twfi\n\tisb" ::: "memory");
     uint64_t hppir;
     __asm__ volatile ("mrs %0, icc_hppir1_el1" : "=r" (hppir));
     intid = static_cast<uint32_t> (hppir & 0xffffff);
+    if (intid >= 1020) { continue; }
+    if (intid == kVirtualTimerPpi) {
+      uint32_t pending[ARMCPU_SLEEP_SPI_WORDS] = {};
+      for (unsigned w = 1; w < words; w++) { pending[w] = read32 (gDist, 0x200 + 4 * w); }   // ISPENDR
+      const uint32_t source = armcpu_sleep_pending_source (pending, keep);
+      if (source != ARMCPU_SLEEP_SPURIOUS && board != nullptr && board->should_wake != nullptr && board->should_wake (source)) {
+        intid = source;
+        reason = ArmcpuWakeSource;
+        break;
+      }
+      const enum armcpu_timer_event event = armcpu_sleep_timer (counter (), wakeAt, &tickAt, tickTicks);
+      if (event == ArmcpuTimerTick) {
+        board->tick ();
+        st.ticks = st.ticks + 1;
+      }
+      sleepArmTimer (event == ArmcpuTimerWake ? ARMCPU_SLEEP_NEVER : armcpu_sleep_next (wakeAt, tickAt));   // the line drops
+      sleepAcknowledge ();
+      if (event == ArmcpuTimerWake) {
+        reason = ArmcpuWakeTimer;
+        break;
+      }
+      continue;
+    }
     int says = 0;
     if (board != nullptr && board->should_wake != nullptr && sleepIsWakeSource (board, intid)) { says = board->should_wake (intid); }
-    reason = armcpu_sleep_decide (intid, says, timer);
+    reason = armcpu_sleep_decide (intid, says, ARMCPU_SLEEP_NO_TIMER);
     if (reason != ArmcpuWakeNone) { break; }
-    if (intid >= 32 && intid < 1020) { write32 (gDist, 0x280 + (intid / 32) * 4, 1U << (intid % 32)); }   // ICPENDR
-    if (intid != 1023) { st.spurious = st.spurious + 1; }
+    sleepAcknowledge ();
+    st.spurious = st.spurious + 1;
+    if (!armcpu_sleep_storm (&storm, intid, counter (), gCounterHz / 1000)) { continue; }
+    const uint32_t bit = 1U << (intid % 32);
+    if (intid >= 32 && (keep[intid / 32] & bit) != 0) {
+      keep[intid / 32] &= ~bit;
+      write32 (gDist, 0x180 + 4 * (intid / 32), bit);   // ICENABLER: off until the enables are put back
+      (void)waitClear (gDist, 0, 1U << 31);
+      st.masked = st.masked + 1;
+      if (armcpu_sleep_armed (keep) || wakeAt != ARMCPU_SLEEP_NEVER) { continue; }
+    }
+    reason = ArmcpuWakeStorm;   // nothing left to wake the system, or a line this wait cannot turn off
+    break;
   }
   st.phase = 4;
   value = 0;
   __asm__ volatile ("msr icc_igrpen1_el1, %0\n\tdsb sy\n\tisb" :: "r" (value) : "memory");
-  value = 2;
-  __asm__ volatile ("msr cntv_ctl_el0, %0\n\tisb" :: "r" (value) : "memory");
+  sleepArmTimer (ARMCPU_SLEEP_NEVER);
   if (board != nullptr && board->restore != nullptr) { board->restore (); }
   for (unsigned w = 1; w < words; w++) { write32 (gDist, 0x180 + 4 * w, 0xffffffff); }
   (void)waitClear (gDist, 0, 1U << 31);
