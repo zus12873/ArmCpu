@@ -33,6 +33,23 @@ delay after their deadline (same ranges), again awake and out of idle. The
 timer is one per core and one-shot; the delay out of idle is the time the
 core takes to leave idle.
 
+`platform-sleep=1` lets a board without Apple's sleep hardware sleep to idle.
+With a PSCI conduit in `/psci`, the driver installs `arm64_platform_sleep_hook`
+(defined by the board's XNU patch in `ml_arm_sleep`). `haltCPU` records the
+core as stopped. `quiesceCPU`, which `cpu_sleep` calls on each core, enters
+`ml_arm_sleep` while the system quiesces. A core other than the boot core then
+turns itself off with PSCI CPU_OFF and comes back through CPU_ON and the reset
+vector, set up by `initCPU(false)` as at its first start. The boot core waits
+with interrupts masked. Only the board's wake sources stay enabled at the
+distributor (`armcpu_sleep_register`, `ArmCpuSleep.h`), and WFI ends on a
+pending one. The board's `should_wake` decides, or the virtual timer does after
+`platform-sleep-wake-after=<seconds>`. The board's `prepare` and `restore` run
+around the wait, and the enables are put back. The waking interrupt stays
+pending for its driver, and `initCPU(false)` turns the boot core's CPU
+interface and timer on again. `armcpu_sleep_stats` records the phase reached,
+the sleeps, spurious wakes, the waking INTID and reason, and the time asleep.
+`tools/check-sleep-host.py` tests the logic on the host.
+
 `armcpu-idle-latency-us=N` registers every core with that time as its power
 gate latency (default 0: none). The kernel then spins through a delay shorter
 than N instead of blocking the thread on a timer, sets an idle core's timer N

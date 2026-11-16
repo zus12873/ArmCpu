@@ -8,6 +8,7 @@
 #include <libkern/libkern.h>
 #include <machine/machine_routines.h>
 #include <pexpert/pexpert.h>
+#include "ArmCpuSleep.h"
 
 // Exact private entry from Darwin 23 arm/rtclock.h. Its full data header is
 // not exported to IOKit; the IRQ path calls the real kernel implementation.
@@ -55,7 +56,15 @@ volatile uint32_t armcpu_cpu_init_completed = 0;
 // 1 PSCI_VERSION, 2 PSCI_FEATURES of CPU_SUSPEND (negative: absent; bit 0 OS-initiated mode, bit 1 extended state IDs),
 // 3 PSCI_FEATURES of PSCI_SET_SUSPEND_MODE (0: present).
 volatile int32_t armcpu_psci[4];
+// Platform sleep (boot-arg platform-sleep=1, ArmCpuSleep.h): what the last sleeps did; last_cpu_off_rc is the PSCI answer of the last
+// CPU_OFF that returned (a CPU_OFF that works does not return).
+volatile struct armcpu_sleep_stats armcpu_sleep_stats;
+volatile int32_t armcpu_sleep_last_cpu_off_rc = 0;
 }
+// The board XNU patch's hook in ml_arm_sleep (osfmk/arm64/cpu.c): called on each core on its way to sleep, the boot core last.
+extern "C" void (*arm64_platform_sleep_hook) (boolean_t boot_cpu);
+extern "C" void ml_arm_sleep (void) __attribute__ ((noreturn));
+extern "C" boolean_t ml_is_quiescing (void);
 
 #define ARMCPU_SMP_SLOTS 8
 
@@ -93,6 +102,14 @@ static uint64_t gCounterHz = 0;           // CNTFRQ_EL0
 // for a deadline closer than this. 0, the default, registers no latency: every delay of a thread blocks and a timer is taken as late
 // as the core takes to leave idle. The rows of armcpu_stats_row measure that time (timer late, in idle).
 static uint32_t gIdleLatencyNs = 0;
+// Platform sleep (see the functions above ArmCpu::enableCPUTimeBase).
+static bool gSleepEnabled = false;                         // platform-sleep=1
+static bool gSleepHvc = false;                             // the PSCI conduit, from /psci
+static uint32_t gSleepWakeAfterS = 0;                      // platform-sleep-wake-after=<seconds>; 0 none
+static const struct armcpu_sleep_board *volatile gSleepBoard = nullptr;
+static const uint32_t kVirtualTimerPpi = 27;
+static bool psciConduit (bool *hvc);
+static void armcpuPlatformSleep (boolean_t bootCpu);
 
 class ArmCpu : public IOCPU {
   OSDeclareDefaultStructors (ArmCpu)
@@ -544,6 +561,17 @@ bool ArmCpu::start (IOService *provider)
     __asm__ volatile ("mrs %0, mpidr_el1" : "=r" (bootMpidr));
     armcpu_boot_mpidr = static_cast<uint32_t> (bootMpidr);
     if ((!skipGic && !prepareGic ()) || !IOCPU::start (provider)) { return false; }
+    // Platform sleep: the hook goes in only with the switch on and a PSCI conduit to turn cores off; otherwise ml_arm_sleep keeps its
+    // own path and the system keeps its sleep-disabled default.
+    unsigned sleep = 0;
+    PE_parse_boot_argn ("platform-sleep", &sleep, sizeof (sleep));
+    unsigned wakeAfter = 0;
+    PE_parse_boot_argn ("platform-sleep-wake-after", &wakeAfter, sizeof (wakeAfter));
+    gSleepWakeAfterS = wakeAfter;
+    if (sleep == 1 && !skipGic && psciConduit (&gSleepHvc)) {
+      gSleepEnabled = true;
+      arm64_platform_sleep_hook = &armcpuPlatformSleep;
+    }
   }
   cpuName = OSSymbol::withCStringNoCopy ("ARM architectural boot CPU");
   if (cpuName == nullptr) { return false; }
@@ -686,7 +714,8 @@ void ArmCpu::startSecondary (void)
 void ArmCpu::initCPU (bool boot)
 {
   if (secondary) {
-    if (!boot) { panic ("ArmCpu: secondary resume is unsupported"); }
+    // !boot: the core comes back from platform sleep (CPU_OFF, then CPU_ON through the reset vector) and is set up as at its first
+    // start; only the start-up counters are left alone.
     armcpu_smp_step[logicalId] = 5;
     uint64_t mpidr;
     __asm__ volatile ("mrs %0, mpidr_el1" : "=r" (mpidr));
@@ -703,13 +732,23 @@ void ArmCpu::initCPU (bool boot)
     enableCPUTimeBase (true);
     setCPUState (kIOCPUStateRunning);
     armcpu_smp_step[logicalId] = 7;
-    armcpu_smp_running = armcpu_smp_running + 1;
+    if (boot) { armcpu_smp_running = armcpu_smp_running + 1; }
     // XNU clears SIGPdisabled for a core the first time that core takes an IPI, and cpu_signal() silently skips a core until then; Apple's
     // CPU driver provokes it with a self-IPI from initCPU (osfmk/kern/machine.c, processor_up).
     if (gSelfIpi) { signalCPU (this); }
     return;
   }
-  if (!boot) { panic ("ArmCpu: secondary/resume CPU startup is unsupported"); }
+  if (!boot) {
+    // The boot core back from platform sleep (arm_init_cpu's wake path): its CPU interface and timer on again. The distributor kept its
+    // configuration; sleepBootWait put its enables back before returning.
+    if (!skipGic) {
+      enableGic ();
+      if (gSpiIpi) { spiIpiConfigure (gDist, logicalId, affinity); }
+      enableCPUTimeBase (true);
+    }
+    setCPUState (kIOCPUStateRunning);
+    return;
+  }
   if (skipGic) {
     // Explicit A/B hardware diagnostic: do not touch GIC MMIO or enable an
     // interrupt source. CPU registration still happens; the timer is left off.
@@ -964,6 +1003,113 @@ extern "C" void armcpu_ipi_selftest (uint64_t aff)
   __asm__ volatile ("dsb ishst\n\tmsr icc_sgi1r_el1, %0\n\tisb" :: "r" (sgi) : "memory");
 }
 
+// ---- Platform sleep (boot-arg platform-sleep=1; ArmCpuSleep.h) ----
+// XNU's sleep ends in ml_arm_sleep, whose non-Apple arm64_prepare_for_sleep is a WFI loop with no way back. The board XNU patch calls
+// arm64_platform_sleep_hook there instead: a core other than the boot core goes off with PSCI CPU_OFF (it comes back through CPU_ON
+// and the reset vector when the system wakes, as at boot); the boot core waits here with interrupts masked for one of the board's
+// wake sources, then returns, and the patch resumes it through arm_init_cpu's wake path.
+extern "C" int armcpu_sleep_register (const struct armcpu_sleep_board *board)
+{
+  if (!gSleepEnabled) { return KERN_NOT_SUPPORTED; }
+  __atomic_store_n (&gSleepBoard, board, __ATOMIC_RELEASE);
+  return 0;
+}
+
+static void sleepCoreOff (void)
+{
+  uint64_t value = 2;   // timer masked
+  __asm__ volatile ("msr cntv_ctl_el0, %0\n\tisb" :: "r" (value) : "memory");
+  value = 0;
+  __asm__ volatile ("msr icc_igrpen1_el1, %0\n\tdsb sy\n\tisb" :: "r" (value) : "memory");
+  // PSCI 0.2 CPU_OFF. It returns only when it fails; the core then waits as XNU's own loop would.
+  const int64_t rc = psciCall (gSleepHvc, 0x84000002ULL, 0, 0, 0);
+  armcpu_sleep_last_cpu_off_rc = static_cast<int32_t> (rc);
+  armcpu_sleep_stats.cpu_off_failures = armcpu_sleep_stats.cpu_off_failures + 1;
+  __asm__ volatile ("msr daifset, #15" ::: "memory");
+  for (;;) { __asm__ volatile ("dsb sy\n\twfi" ::: "memory"); }
+}
+
+static bool sleepIsWakeSource (const struct armcpu_sleep_board *board, uint32_t intid)
+{
+  for (uint32_t i = 0; board != nullptr && i < board->wake_spi_count; i++) {
+    if (board->wake_spis[i] == intid) { return true; }
+  }
+  return false;
+}
+
+// The boot core, interrupts masked: only the wake sources enabled at the distributor, the CPU interface's Group 1 on so that WFI ends
+// on a pending one, and nothing acknowledged. A source the board turns down (and every other pending SPI) has its pending state
+// cleared; the wake source stays pending for its driver to take after the wake.
+static void sleepBootWait (void)
+{
+  volatile struct armcpu_sleep_stats &st = armcpu_sleep_stats;
+  __asm__ volatile ("msr daifset, #15" ::: "memory");
+  const struct armcpu_sleep_board *board = __atomic_load_n (&gSleepBoard, __ATOMIC_ACQUIRE);
+  const uint32_t timer = gSleepWakeAfterS != 0 ? kVirtualTimerPpi : ARMCPU_SLEEP_NO_TIMER;
+  st.phase = 2;
+  if (gDist == 0 || (board == nullptr && timer == ARMCPU_SLEEP_NO_TIMER)) {
+    // Nothing could wake the system: return at once (a sleep that lasts no time) rather than wait for good.
+    st.last_reason = ArmcpuWakeNone;
+    st.phase = 5;
+    return;
+  }
+  const unsigned lines = ((read32 (gDist, 4) & 31) + 1) * 32;
+  const unsigned words = lines / 32 < ARMCPU_SLEEP_SPI_WORDS ? lines / 32 : ARMCPU_SLEEP_SPI_WORDS;
+  uint32_t saved[ARMCPU_SLEEP_SPI_WORDS] = {}, keep[ARMCPU_SLEEP_SPI_WORDS];
+  for (unsigned w = 1; w < words; w++) { saved[w] = read32 (gDist, 0x100 + 4 * w); }
+  armcpu_sleep_keep (saved, board != nullptr ? board->wake_spis : nullptr, board != nullptr ? board->wake_spi_count : 0, keep);
+  for (unsigned w = 1; w < words; w++) { write32 (gDist, 0x180 + 4 * w, 0xffffffff); }
+  (void)waitClear (gDist, 0, 1U << 31);
+  for (unsigned w = 1; w < words; w++) { if (keep[w] != 0) { write32 (gDist, 0x100 + 4 * w, keep[w]); } }
+  if (board != nullptr && board->prepare != nullptr) { board->prepare (); }
+  uint64_t value;
+  if (timer != ARMCPU_SLEEP_NO_TIMER) {
+    value = gCounterHz * gSleepWakeAfterS;
+    __asm__ volatile ("msr cntv_tval_el0, %0" :: "r" (value) : "memory");
+    value = 1;   // enabled, not masked
+    __asm__ volatile ("msr cntv_ctl_el0, %0\n\tisb" :: "r" (value) : "memory");
+  }
+  const uint64_t start = counter ();
+  value = 1;
+  __asm__ volatile ("msr icc_igrpen1_el1, %0\n\tdsb sy\n\tisb" :: "r" (value) : "memory");
+  st.phase = 3;
+  uint32_t intid = 1023;
+  enum armcpu_wake_reason reason = ArmcpuWakeNone;
+  for (;;) {
+    __asm__ volatile ("dsb sy\n\twfi\n\tisb" ::: "memory");
+    uint64_t hppir;
+    __asm__ volatile ("mrs %0, icc_hppir1_el1" : "=r" (hppir));
+    intid = static_cast<uint32_t> (hppir & 0xffffff);
+    int says = 0;
+    if (board != nullptr && board->should_wake != nullptr && sleepIsWakeSource (board, intid)) { says = board->should_wake (intid); }
+    reason = armcpu_sleep_decide (intid, says, timer);
+    if (reason != ArmcpuWakeNone) { break; }
+    if (intid >= 32 && intid < 1020) { write32 (gDist, 0x280 + (intid / 32) * 4, 1U << (intid % 32)); }   // ICPENDR
+    if (intid != 1023) { st.spurious = st.spurious + 1; }
+  }
+  st.phase = 4;
+  value = 0;
+  __asm__ volatile ("msr icc_igrpen1_el1, %0\n\tdsb sy\n\tisb" :: "r" (value) : "memory");
+  value = 2;
+  __asm__ volatile ("msr cntv_ctl_el0, %0\n\tisb" :: "r" (value) : "memory");
+  if (board != nullptr && board->restore != nullptr) { board->restore (); }
+  for (unsigned w = 1; w < words; w++) { write32 (gDist, 0x180 + 4 * w, 0xffffffff); }
+  (void)waitClear (gDist, 0, 1U << 31);
+  for (unsigned w = 1; w < words; w++) { if (saved[w] != 0) { write32 (gDist, 0x100 + 4 * w, saved[w]); } }
+  st.last_intid = intid;
+  st.last_reason = reason;
+  st.asleep_ticks = counter () - start;
+  st.entries = st.entries + 1;
+  st.phase = 5;
+}
+
+static void armcpuPlatformSleep (boolean_t bootCpu)
+{
+  if (!bootCpu) { sleepCoreOff (); }
+  armcpu_sleep_stats.phase = 1;
+  sleepBootWait ();
+}
+
 void ArmCpu::enableCPUTimeBase (bool enabled)
 {
   uint64_t value = enabled ? 1 : 2;
@@ -973,19 +1119,24 @@ void ArmCpu::enableCPUTimeBase (bool enabled)
 void ArmCpu::quiesceCPU (void)
 {
   armcpu_quiesce_calls=armcpu_quiesce_calls+1;
+  // System sleep: XNU's cpu_sleep (no USE_APPLEARMSMP on this kernel) only calls this, and a return is a "zombie processor" panic.
+  // ml_arm_sleep takes the core to the platform hook above; the boot core comes back through arm_init_cpu, never here.
+  if (gSleepEnabled && ml_is_quiescing ()) {
+    enableCPUTimeBase (false);
+    ml_arm_sleep ();
+  }
   if(diagnosePower)panic("ArmCpu: unsupported quiesce requested before timer/GIC disable caller=%p halt=%u timer=%llu phase=%u",__builtin_return_address(0),armcpu_halt_calls,armcpu_timer_interrupts,armcpu_irq_phase);
   enableCPUTimeBase (false);
   uint64_t value = 0;
   __asm__ volatile ("msr icc_igrpen1_el1, %0\n\tdsb sy\n\tisb" :: "r" (value) : "memory");
 }
 
+// IOCPUSleepKernel, its only caller, calls this on the boot core for every core in turn before processor_sleep() takes that core
+// down from its own context (cpu_sleep → quiesceCPU): only the state is recorded here.
 void ArmCpu::haltCPU (void)
 {
   armcpu_halt_calls=armcpu_halt_calls+1;
-  quiesceCPU ();
   setCPUState (kIOCPUStateStopped);
-  __asm__ volatile ("msr daifset, #15" ::: "memory");
-  for (;;) { __asm__ volatile ("wfi"); }
 }
 
 // The new core runs with its MMU and caches off until start_cpu enables them, so it reads the reset vector, ResetHandlerData
