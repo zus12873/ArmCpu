@@ -78,6 +78,8 @@ N. Row 0 shows the value.
 
 Counter sampling orders `ISB` before reading `CNTVCT_EL0`. GIC control, SGI and EOI sequences retain their synchronization barriers. Multi-instruction inline assembly uses newline separators.
 
+Every GIC register access is one `LDR`/`STR` (8, 32 or 64 bits) with its address in a register and no writeback. A hypervisor that traps and emulates the GIC (Gunyah on Snapdragon) can decode only that form; a post-indexed or paired access, which the compiler picks for a loop over a register file, comes back as a synchronous external abort. `tools/check-mmio-access.py` checks that no access bypasses the accessors and that they stay in that form at `-Os` and `-O2`.
+
 The sheng `scripts/check-bluetooth-shared.py` fixture checks the production
 registration, dispatch, masking and concurrent registration paths. The source
 also compiles with the selected iPadOS 27 arm64e kernel command.

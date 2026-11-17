@@ -161,14 +161,43 @@ static const uint32_t kSgiPpiEnable = 1U | (1U << 27);
 
 static const uint32_t kIpiSpiBase = 1008;   // INTIDs 1008..1015 stand for 'IPI to logical core 0..7'
 
+// Device registers. The hypervisor traps and emulates the GIC, and it can decode only a single load or store of one register without
+// writeback; any other form (a post-indexed load the compiler picks for a loop over a register file, a pair) comes back as a
+// synchronous external abort. Each access is therefore one instruction with its address in a register (tools/check-mmio-access.py).
+static uint8_t read8 (uintptr_t base, unsigned offset)
+{
+  uint32_t value;
+  __asm__ volatile ("ldrb %w0, [%1]" : "=r" (value) : "r" (base + offset) : "memory");
+  return static_cast<uint8_t> (value);
+}
+
+static void write8 (uintptr_t base, unsigned offset, uint8_t value)
+{
+  __asm__ volatile ("strb %w0, [%1]" :: "r" (static_cast<uint32_t> (value)), "r" (base + offset) : "memory");
+}
+
 static uint32_t read32 (uintptr_t base, unsigned offset)
 {
-  return *reinterpret_cast<volatile uint32_t *>(base + offset);
+  uint32_t value;
+  __asm__ volatile ("ldr %w0, [%1]" : "=r" (value) : "r" (base + offset) : "memory");
+  return value;
 }
 
 static void write32 (uintptr_t base, unsigned offset, uint32_t value)
 {
-  *reinterpret_cast<volatile uint32_t *>(base + offset) = value;
+  __asm__ volatile ("str %w0, [%1]" :: "r" (value), "r" (base + offset) : "memory");
+}
+
+static uint64_t read64 (uintptr_t base, unsigned offset)
+{
+  uint64_t value;
+  __asm__ volatile ("ldr %0, [%1]" : "=r" (value) : "r" (base + offset) : "memory");
+  return value;
+}
+
+static void write64 (uintptr_t base, unsigned offset, uint64_t value)
+{
+  __asm__ volatile ("str %0, [%1]" :: "r" (value), "r" (base + offset) : "memory");
 }
 
 // Distributor side of the software IPI of logical core `core`: group 1, edge-triggered, priority 0x80, routed to affinity `aff`, enabled.
@@ -178,7 +207,7 @@ static void spiIpiConfigure (uintptr_t dist, uint32_t core, uint64_t aff)
   write32 (dist, 0x80 + (id / 32) * 4, read32 (dist, 0x80 + (id / 32) * 4) | (1U << (id % 32)));
   write32 (dist, 0xc00 + (id / 16) * 4, read32 (dist, 0xc00 + (id / 16) * 4) | (2U << ((id % 16) * 2)));
   write32 (dist, 0x400 + (id / 4) * 4, 0x80808080);
-  *reinterpret_cast<volatile uint64_t *>(dist + 0x6000 + 8ULL * id) = aff & 0xff00ffffffULL;
+  write64 (dist, 0x6000 + 8 * id, aff & 0xff00ffffffULL);
   __asm__ volatile ("dsb sy" ::: "memory");
   write32 (dist, 0x100 + (id / 32) * 4, 1U << (id % 32));
   __asm__ volatile ("dsb sy" ::: "memory");
@@ -447,7 +476,7 @@ bool ArmCpu::wakeRedistributor (bool local)
   redist = 0;
   for (uint64_t offset = 0; offset + 0x20000 <= redistSize;) {
     armcpu_gic_typer_probe[0] = static_cast<uint32_t> (offset);
-    uint64_t typer = *reinterpret_cast<volatile uint64_t *> (frames + offset + 8);
+    uint64_t typer = read64 (frames + offset, 8);
     armcpu_gic_typer_probe[1] = static_cast<uint32_t> (typer);
     if (static_cast<uint32_t> (typer >> 32) == target) {
       redist = frames + offset;
@@ -923,7 +952,7 @@ extern "C" void armcpu_gic_diag (uint64_t aff, uint32_t *out)
   const uint32_t target = static_cast<uint32_t> ((aff & 0xffffff) | ((aff >> 8) & 0xff000000));
   for (uint64_t offset = 0; offset + 0x20000 <= gFramesSize;) {
     armcpu_gic_diag_stage = 0x100 + static_cast<uint32_t> (offset >> 16);
-    const uint64_t typer = *reinterpret_cast<volatile uint64_t *> (gFrames + offset + 8);
+    const uint64_t typer = read64 (gFrames + offset, 8);
     if (static_cast<uint32_t> (typer >> 32) == target) {
       const uintptr_t redist = gFrames + offset, sgi = redist + 0x10000;
       armcpu_gic_diag_stage = 2; out[0] = read32 (sgi, 0x80);
@@ -1269,10 +1298,10 @@ static IOReturn spiAttachUnlocked (uint32_t intid, bool edge, void (*handler) (v
   write32 (gDist, 0x180 + word, bit); // ICENABLER while it is reconfigured
   if (!waitClear (gDist, 0, 1U << 31)) { return kIOReturnTimeout; }
   write32 (gDist, 0x80 + word, read32 (gDist, 0x80 + word) | bit); // IGROUPR: group 1 (RAZ/WI if secure owns it)
-  *reinterpret_cast<volatile uint8_t *> (gDist + 0x400 + intid) = 0xa0;
+  write8 (gDist, 0x400 + intid, 0xa0);
   const unsigned cfg = 0xc00 + (intid / 16) * 4, shift = (intid % 16) * 2 + 1;
   write32 (gDist, cfg, (read32 (gDist, cfg) & ~(1U << shift)) | ((edge ? 1U : 0U) << shift));
-  *reinterpret_cast<volatile uint64_t *> (gDist + 0x6000 + 8 * intid) = gBootAffinity;
+  write64 (gDist, 0x6000 + 8 * intid, gBootAffinity);
   gSpi[used] = {intid, handler, context, 0};
   __atomic_store_n (&gSpiUsed, used + 1, __ATOMIC_RELEASE);
   __atomic_fetch_or (&gSpiRoutes[intid], 1U << used, __ATOMIC_RELEASE);
@@ -1281,9 +1310,9 @@ static IOReturn spiAttachUnlocked (uint32_t intid, bool edge, void (*handler) (v
   if (readback != nullptr) {
     *readback = ((read32 (gDist, 0x80 + word) & bit) ? 1U : 0U) | ((read32 (gDist, 0x100 + word) & bit) ? 2U : 0U) |
                 (((read32 (gDist, cfg) >> shift) & 1U) << 2) |
-                (static_cast<uint32_t> (*reinterpret_cast<volatile uint8_t *> (gDist + 0x400 + intid)) << 8);
+                (static_cast<uint32_t> (read8 (gDist, 0x400 + intid)) << 8);
   }
-  if (router != nullptr) { *router = *reinterpret_cast<volatile uint64_t *> (gDist + 0x6000 + 8 * intid); }
+  if (router != nullptr) { *router = read64 (gDist, 0x6000 + 8 * intid); }
   return kIOReturnSuccess;
 }
 
